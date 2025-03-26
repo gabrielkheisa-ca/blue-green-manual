@@ -1,0 +1,36 @@
+Gradually Upgrading to the Green App using Blue-Green Deployment:
+
+Now, let's outline the steps for a blue-green deployment. The core idea is to deploy the new (green) version alongside the old (blue) version without disrupting live traffic. Once you're confident the green version is stable, you switch traffic over.
+
+Here's how you can approach this with Terraform and kubectl:
+
+Deploy the Green Application:
+
+Create a new set of Kubernetes resources (Deployment and potentially other configurations) for your "hello-green" app. You can largely duplicate the Terraform configuration for the blue app, but with the following key changes:
+Deployment Name: Change hello-blue-deployment to hello-green-deployment.
+Labels: Update the labels to app: "hello-green" and version: "green".
+Image: Update the image in the container spec to gcr.io/YOUR_PROJECT_ID/hello-green:v1.
+Apply this new Terraform configuration: terraform apply --auto-approve -target=kubernetes_deployment.green_app_deployment -target=kubernetes_service.green_app_service (you might choose to manage the service differently, see step 3).
+Deploy the Green Service (Initially Internal):
+
+You might initially deploy the green app with an internal service (e.g., type: ClusterIP) so it's not immediately exposed to external traffic. This allows you to test the green deployment internally.
+Update the Existing Service Selector (Blue-Green Switch):
+
+This is the crucial step for the traffic switch. Modify the selector of your existing hello-blue-service to now target the pods with the app: "hello-green" and version: "green" labels.
+You can do this using kubectl edit service hello-blue-service or by updating your Terraform configuration for the service and applying it.
+YAML
+
+# Example updated service definition (in YAML or Terraform)
+spec:
+  selector:
+    app: "hello-green"
+    version: "green"
+  ports:
+    - port: 80
+      targetPort: 5000
+  type: LoadBalancer
+Once you apply this change, all incoming traffic to the external IP of hello-blue-service will now be routed to your "hello-green" pods.
+Monitoring and Rollback:
+
+Carefully monitor your application after the switch to ensure everything is working correctly.
+If you encounter issues, you can quickly rollback by changing the selector of the hello-blue-service back to target the blue pods (app: "hello-blue", version: "blue").

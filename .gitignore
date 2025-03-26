@@ -1,0 +1,34 @@
+# Terraform
+.terraform
+*.tfstate
+*.tfstate.*
+crash.log
+override.tf
+override.tf.json
+_backend
+.terraformrc
+terraform.rc
+
+# Docker
+*~
+*/~
+# Prevent Darwin .DS_Store files from being created and polluting commits
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+wheels/
+*.whl
+.env
+
+# General OS and Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
