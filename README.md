@@ -1,6 +1,6 @@
-# Deploying Blue/Green Flask Apps to GKE
+# Deploying Blue/Green Flask Apps to GKE with Terraform Load Balancer Switching
 
-This document outlines the steps to containerize and deploy two simple Flask applications, "Hello, blue" and "Hello, green," to Google Kubernetes Engine (GKE) using a blue-green deployment strategy. This strategy allows for near-zero downtime deployments by maintaining two identical environments, "blue" (live) and "green" (new version).  We will initially deploy the "blue" application, then deploy the "green" application alongside it, gradually transition traffic to "green," and finally scale down the "blue" environment.
+This document outlines the steps to containerize and deploy two simple Flask applications, "Hello, blue" and "Hello, green," to Google Kubernetes Engine (GKE) using a blue-green deployment strategy, **managing traffic switching entirely with Terraform**.  We will use Terraform to update the service selector, eliminating the need for `kubectl` to switch traffic.
 
 ## Prerequisites
 
@@ -97,7 +97,7 @@ CMD ["python", "app.py"]
 
 ## Deploying the Blue Application to GKE with Terraform
 
-Use the following Terraform configuration to create a GKE cluster with a budget-friendly node pool and deploy the "hello-blue" application. This will be our initial live environment (Blue).
+Use the following Terraform configuration to create a GKE cluster with a budget-friendly node pool and deploy the "hello-blue" application as the initial active version.
 
 ```terraform
 terraform {
@@ -105,6 +105,10 @@ terraform {
     google = {
       source  = "hashicorp/google"
       version = "~> 5.0"
+    }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.0"
     }
   }
 }
@@ -114,17 +118,28 @@ provider "google" {
   region  = "YOUR_REGION"
 }
 
-resource "google_container_cluster" "blue_cluster" {
+data "google_client_config" "default" {}
+
+provider "kubernetes" {
+  host  = google_container_cluster.blue_green_cluster.endpoint
+  token = data.google_client_config.default.access_token
+  cluster_ca_certificate = base64decode(
+    google_container_cluster.blue_green_cluster.master_auth[0].cluster_ca_certificate,
+  )
+}
+
+
+resource "google_container_cluster" "blue_green_cluster" {
   name               = "blue-green-cluster"
   location           = "YOUR_REGION"
   remove_default_node_pool = true
   initial_node_count       = 1
 }
 
-resource "google_container_node_pool" "blue_nodes" {
-  name           = "blue-pool"
+resource "google_container_node_pool" "blue_green_nodes" {
+  name           = "blue-green-pool"
   location       = "YOUR_REGION"
-  cluster        = google_container_cluster.blue_cluster.name
+  cluster        = google_container_cluster.blue_green_cluster.name
   node_count     = 2
   autoscaling {
     min_node_count = 1
@@ -133,17 +148,17 @@ resource "google_container_node_pool" "blue_nodes" {
   node_config {
     machine_type = "e2-medium" # Or another budget-friendly type
     oauth_scopes = [
-      "[https://www.googleapis.com/auth/cloud-platform](https://www.googleapis.com/auth/cloud-platform)",
+      "https://www.googleapis.com/auth/cloud-platform",
     ]
   }
 }
 
 resource "kubernetes_deployment" "blue_app_deployment" {
-  depends_on = [google_container_node_pool.blue_nodes]
+  depends_on = [google_container_node_pool.blue_green_nodes]
   metadata {
     name = "hello-blue-deployment"
     labels = {
-      app     = "hello-blue"
+      app     = "hello-app" # Generic app label for service selector
       version = "blue"
     }
   }
@@ -151,14 +166,14 @@ resource "kubernetes_deployment" "blue_app_deployment" {
     replicas = 2
     selector {
       match_labels = {
-        app     = "hello-blue"
+        app     = "hello-app" # Generic app label for service selector
         version = "blue"
       }
     }
     template {
       metadata {
         labels = {
-          app     = "hello-blue"
+          app     = "hello-app" # Generic app label for service selector
           version = "blue"
         }
       }
@@ -175,19 +190,18 @@ resource "kubernetes_deployment" "blue_app_deployment" {
   }
 }
 
-resource "kubernetes_service" "blue_app_service" {
+resource "kubernetes_service" "app_service" { # Single service for blue/green switch
   depends_on = [kubernetes_deployment.blue_app_deployment]
   metadata {
-    name = "hello-blue-service"
+    name = "hello-app-service"
     labels = {
-      app     = "hello-blue"
-      version = "blue"
+      app = "hello-app" # Generic app label
     }
   }
   spec {
     selector = {
-      app     = "hello-blue"
-      version = "blue"
+      app     = "hello-app" # Generic app label
+      version = "blue"      # Initially pointing to blue
     }
     ports {
       port        = 80
@@ -198,45 +212,41 @@ resource "kubernetes_service" "blue_app_service" {
 }
 ```
 
-1.  Save this code as a `.tf` file (e.g., `blue_deployment.tf`).
+1.  Save this code as a `.tf` file (e.g., `blue_green_deployment.tf`).
 2.  Initialize Terraform: `terraform init`
 3.  Plan the deployment: `terraform plan`
 4.  Apply the configuration: `terraform apply --auto-approve`
 
-After applying this configuration, the "hello-blue" application will be deployed and accessible via the external IP provided by the LoadBalancer service. This is your initial "Blue" environment, serving live traffic.
+After applying, the "hello-blue" application will be live and accessible through the LoadBalancer IP.
 
 ## Gradually Upgrading to the Green App using Blue-Green Deployment
 
-Now we will deploy the "Green" application and gradually shift traffic from "Blue" to "Green."
+1.  **Deploy the Green Application (without immediate traffic):**
 
-1.  **Deploy the Green Application (Initial Deployment):**
-
-    Create a new Terraform configuration file (e.g., `green_deployment.tf`) or modify your existing `blue_deployment.tf` to include resources for the "hello-green" app.  Crucially, ensure the **service is NOT updated yet** to point to green. We want to deploy green alongside blue initially, without live traffic.
-
-    Here's an example of the Terraform configuration additions for the "green" deployment.  **Note**: We are deploying the `kubernetes_deployment` for green, but we are **not** creating a separate service for green. We will reuse the existing `hello-blue-service` to control traffic.
+    Add the following Terraform configuration to the same `.tf` file (or create a new one, ensuring you have the `kubernetes` provider configured as above). This will deploy the "hello-green" application alongside the blue one, but initially, the service will still point to "blue".
 
     ```terraform
     resource "kubernetes_deployment" "green_app_deployment" {
-      depends_on = [google_container_node_pool.blue_nodes] # Ensure nodes are ready
+      depends_on = [google_container_node_pool.blue_green_nodes]
       metadata {
         name = "hello-green-deployment"
         labels = {
-          app     = "hello-green"
+          app     = "hello-app" # Generic app label, same as blue
           version = "green"
         }
       }
       spec {
-        replicas = 2 # Start with the same replica count as blue, or adjust as needed
+        replicas = 2
         selector {
           match_labels = {
-            app     = "hello-green"
+            app     = "hello-app" # Generic app label, same as blue
             version = "green"
           }
         }
         template {
           metadata {
             labels = {
-              app     = "hello-green"
+              app     = "hello-app" # Generic app label, same as blue
               version = "green"
             }
           }
@@ -260,103 +270,74 @@ Now we will deploy the "Green" application and gradually shift traffic from "Blu
     terraform apply --auto-approve -target=kubernetes_deployment.green_app_deployment
     ```
 
-    At this point, you have both "blue" and "green" applications running in your cluster. However, the `hello-blue-service` is still directing traffic only to the "blue" pods. You can verify the "green" deployment is running using `kubectl get deployments`.
+    At this stage, both blue and green applications are running in your cluster, but the `hello-app-service` is still directing traffic to the blue deployment.
 
-2.  **Testing the Green Application (Optional but Recommended):**
+2.  **Switch Traffic to the Green Application (Terraform Service Update):**
 
-    Before shifting live traffic, it's highly recommended to test the "green" application.  Since it's not exposed via the `hello-blue-service` yet, you can use port-forwarding to access it directly:
-
-    ```bash
-    kubectl port-forward deployment/hello-green-deployment 8080:5000
-    ```
-
-    Now you can access the "green" application in your browser at `http://localhost:8080`. Perform thorough testing to ensure the "green" application is working as expected.
-
-3.  **Gradually Redirect Traffic to Green by Updating the Service Selector:**
-
-    Now we will start directing traffic to the "green" application. We do this by updating the selector of the `hello-blue-service` to target the "green" pods.  Instead of an immediate switch, we will perform a complete switch in this example for simplicity, but in a real-world scenario, you might use more advanced traffic management tools (like Ingress controllers with traffic splitting or service mesh solutions) for a truly gradual shift (e.g., 10% to green, then 50%, then 100%).
-
-    For this example, we will directly update the service selector. You can do this by editing the service definition using `kubectl`:
-
-    ```bash
-    kubectl edit service hello-blue-service
-    ```
-
-    And change the `selector` section from targeting "blue":
-
-    ```yaml
-    spec:
-      selector:
-        app: "hello-blue"
-        version: "blue" # Currently points to blue
-    ```
-
-    to targeting "green":
-
-    ```yaml
-    spec:
-      selector:
-        app: "hello-green"
-        version: "green" # Now points to green
-    ```
-
-    Save and close the editor. `kubectl` will apply the changes.  Alternatively, you can update the Terraform configuration for the `kubernetes_service` resource and apply it:
+    To switch traffic to the green application, modify the `kubernetes_service` resource in your Terraform configuration. Change the `selector` section from targeting `version = "blue"` to `version = "green"`:
 
     ```terraform
-    resource "kubernetes_service" "blue_app_service" {
-      # ... (other configurations remain the same)
+    resource "kubernetes_service" "app_service" { # Single service for blue/green switch
+      depends_on = [kubernetes_deployment.blue_app_deployment, kubernetes_deployment.green_app_deployment] # Add green deployment dependency
+      metadata {
+        name = "hello-app-service"
+        labels = {
+          app = "hello-app" # Generic app label
+        }
+      }
       spec {
         selector = {
-          app     = "hello-green" # Changed to hello-green
-          version = "green"     # Changed to green
+          app     = "hello-app" # Generic app label
+          version = "green"      # Now pointing to green!
+        }
+        ports {
+          port        = 80
+          target_port = 5000
+        }
+        type = "LoadBalancer"
+      }
+    }
+    ```
+
+    Apply the updated Terraform configuration, targeting only the service:
+
+    ```bash
+    terraform apply --auto-approve -target=kubernetes_service.app_service
+    ```
+
+    Terraform will update the service's selector, and traffic will now be routed to the "hello-green" application. **You have switched traffic using Terraform without `kubectl`!**
+
+3.  **Monitoring and Rollback:**
+
+    Monitor your application after the switch by accessing the LoadBalancer IP. Verify that you are now seeing "Hello, green!".  If issues arise, quickly rollback by reverting the `selector` in the `kubernetes_service` resource back to `version = "blue"` and applying Terraform again, targeting the service:
+
+    ```terraform
+    # Rollback selector to blue
+    resource "kubernetes_service" "app_service" {
+      # ... (rest of the service definition remains the same)
+      spec {
+        selector = {
+          app     = "hello-app"
+          version = "blue"      # Rollback to blue
         }
         # ...
       }
     }
+
+    terraform apply --auto-approve -target=kubernetes_service.app_service
     ```
 
-    Apply the updated Terraform configuration: `terraform apply --auto-approve -target=kubernetes_service.blue_app_service`
+    This will immediately switch traffic back to the stable "blue" version.
 
-    After updating the service selector, the `hello-blue-service` will now route all traffic to the "green" pods.  The "green" application is now live!
+4.  **Cleanup (Optional):**
 
-4.  **Monitoring and Rollback during Transition:**
+    Once the green deployment is stable and you are confident, you can scale down or remove the blue deployment resources using Terraform if desired.  For example, you might scale down the `blue_app_deployment` replicas to 0 or remove the resource entirely from your Terraform configuration and apply the changes.
 
-    **Crucially, monitor your application closely immediately after updating the service selector.** Observe metrics, logs, and user feedback.  If any issues arise with the "green" application, you need to be able to rollback quickly.
+## Key Considerations for Blue-Green Deployments
 
-    **To rollback to "blue":**  Simply revert the service selector back to target the "blue" pods.  Use `kubectl edit service hello-blue-service` or re-apply the Terraform configuration with the original "blue" selector:
+* **Database Migrations:** Plan for database schema changes to be compatible with both versions during the transition.
+* **Feature Flags:** Consider using feature flags for more complex rollouts and granular control.
+* **Testing:** Thoroughly test the green environment before switching production traffic. Consider internal testing before public switch.
+* **Health Checks:** Ensure proper health checks are configured for your deployments to allow Kubernetes to automatically manage pod health and availability.
 
-    ```yaml
-    spec:
-      selector:
-        app: "hello-blue"
-        version: "blue" # Rollback to blue
-    ```
-
-    This will instantly switch traffic back to the stable "blue" environment, minimizing downtime in case of problems with "green."
-
-5.  **Scaling Down (or Removing) the Blue Deployment:**
-
-    Once you are confident that the "green" deployment is stable and performing as expected for a sufficient period, you can scale down the "blue" deployment to zero replicas to conserve resources.  Keeping the "blue" deployment running (even at a reduced replica count) for a while longer after the switch provides an immediate rollback option.
-
-    To scale down the "blue" deployment to zero replicas using `kubectl`:
-
-    ```bash
-    kubectl scale deployment hello-blue-deployment --replicas=0
-    ```
-
-    Or, in Terraform, update the `kubernetes_deployment.blue_app_deployment` resource:
-
-    ```terraform
-    resource "kubernetes_deployment" "blue_app_deployment" {
-      # ...
-      spec {
-        replicas = 0 # Scale down to zero
-        # ...
-      }
-    }
-    ```
-
-    Apply the Terraform configuration: `terraform apply --auto-approve -target=kubernetes_deployment.blue_app_deployment`
-
-    Alternatively, if you are completely confident and want to remove the "blue" deployment resources entirely, you can remove the `kubernetes_deployment.blue_app_deployment` resource from your Terraform configuration and apply it. **However, be cautious when completely removing the "blue" deployment immediately after switching to "green," as it eliminates your quick rollback option.**  It's generally safer to scale down first and remove later after more observation.
-
+This `README.md` now provides a complete overview of blue-green deployments on GKE using Terraform for traffic switching. Remember to replace the placeholder values with your actual project details!
