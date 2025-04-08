@@ -4,6 +4,10 @@ terraform {
       source  = "hashicorp/google"
       version = "~> 5.0"
     }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.0" # Or a more recent version. Check Terraform Registry for latest.
+    }
   }
 }
 
@@ -11,6 +15,14 @@ provider "google" {
   project = "cai-test-gke"
   region  = "us-central1"  # Changed region to Iowa
 }
+
+provider "kubernetes" {
+  host                   = google_container_cluster.blue_green_cluster.endpoint
+  token                  = data.google_client_config.default.access_token
+  cluster_ca_certificate = base64decode(google_container_cluster.blue_green_cluster.master_auth[0].cluster_ca_certificate)
+}
+
+data "google_client_config" "default" {}
 
 resource "google_container_cluster" "blue_green_cluster" {
   name               = "blue-green-cluster"
