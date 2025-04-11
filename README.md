@@ -1,22 +1,33 @@
-# Deploying Blue/Green Flask Apps to GKE with Terraform (Simplified Blue-Green Switch)
+Certainly! Yes, achieving traffic splitting like 30% to blue and 70% to green *is* definitely possible with Kubernetes, especially when using a suitable Ingress Controller or a Service Mesh that supports traffic weighting.  And yes, you can manage this traffic splitting declaratively with Terraform.
 
-This document outlines the steps to containerize and deploy two simple Flask applications, "Hello, blue" and "Hello, green," to Google Kubernetes Engine (GKE) using a blue-green deployment strategy, managed entirely with Terraform for traffic switching.
+However, **directly with the standard Kubernetes `Service` object and selectors alone, you cannot achieve weighted traffic splitting.**  You need to leverage a higher-level traffic management layer.
+
+For this updated README, I will focus on using **Kubernetes Gateway API** as it's a modern and increasingly adopted way to manage ingress and traffic routing in Kubernetes, and it natively supports traffic splitting.  If you prefer an Ingress Controller specific example (like Nginx Ingress with annotations for canary), let me know, but Gateway API is a good direction for new deployments.
+
+Here's the revised README focusing on Canary Deployment with Traffic Splitting using Kubernetes Gateway API and Terraform:
+
+--- START OF FILE README (Canary Traffic Split).md ---
+
+# Canary Deploying Flask Apps to GKE with Terraform (Traffic Splitting with Gateway API)
+
+This document outlines the steps to containerize and deploy two simple Flask applications, "Hello, stable" and "Hello, canary," to Google Kubernetes Engine (GKE) using a canary deployment strategy with **traffic splitting**, managed with Terraform and Kubernetes Gateway API. We'll demonstrate how to configure traffic to be split, for example, 70% to the stable version and 30% to the canary version, allowing for gradual rollouts and risk mitigation.
 
 ## Prerequisites
 
-* Google Cloud account with a project set up.
-* Google Cloud CLI (`gcloud`) installed and configured.
-* Docker installed.
-* Terraform installed and configured to connect to your Google Cloud project.
-* `kubectl` installed and configured to connect to your GKE cluster. (Usually configured automatically when you create a GKE cluster and have `gcloud` installed).
+*   Google Cloud account with a project set up.
+*   Google Cloud CLI (`gcloud`) installed and configured.
+*   Docker installed.
+*   Terraform installed and configured to connect to your Google Cloud project.
+*   `kubectl` installed and configured to connect to your GKE cluster.
+*   **Kubernetes Gateway API installed in your GKE cluster.** (This may require installing a Gateway API compatible Ingress Controller like Gateway API implementation for Nginx, Contour, or others.  Refer to your chosen Ingress Controller's documentation for installation instructions).
 
 ## Application Files
 
 You should have the following files for each application:
 
-**Hello, blue:**
+**Hello, stable:**
 
-* `app.py`:
+*   `app.py`:
 
     ```python
     from flask import Flask
@@ -24,22 +35,22 @@ You should have the following files for each application:
     app = Flask(__name__)
 
     @app.route("/")
-    def hello_blue():
-        return "<h1 style='color:blue'>Hello, blue!</h1>"
+    def hello_stable():
+        return "<h1 style='color:orange'>Hello, stable!</h1>"
 
     if __name__ == "__main__":
         app.run(host='0.0.0.0', port=5000)
     ```
 
-* `requirements.txt`:
+*   `requirements.txt`:
 
     ```
     Flask
     ```
 
-**Hello, green:**
+**Hello, canary:**
 
-* `app.py`:
+*   `app.py`:
 
     ```python
     from flask import Flask
@@ -47,14 +58,14 @@ You should have the following files for each application:
     app = Flask(__name__)
 
     @app.route("/")
-    def hello_green():
-        return "<h1 style='color:green'>Hello, green!</h1>"
+    def hello_canary():
+        return "<h1 style='color:purple'>Hello, canary!</h1>"
 
     if __name__ == "__main__":
         app.run(host='0.0.0.0', port=5000)
     ```
 
-* `requirements.txt`:
+*   `requirements.txt`:
 
     ```
     Flask
@@ -74,31 +85,31 @@ CMD ["python", "app.py"]
 
 ## Containerizing and Pushing to Google Container Registry (GCR)
 
-1.  **Build and tag the "blue" application image:**
+1.  **Build and tag the "stable" application image:**
 
-    Navigate to the "blue" application directory in Cloud Shell and run:
+    Navigate to the "stable" application directory in Cloud Shell and run:
 
     ```bash
-    docker build -t gcr.io/YOUR_PROJECT_ID/hello-blue:v1 .
-    docker push gcr.io/YOUR_PROJECT_ID/hello-blue:v1
+    docker build -t gcr.io/YOUR_PROJECT_ID/hello-stable:v1 .
+    docker push gcr.io/YOUR_PROJECT_ID/hello-stable:v1
     ```
 
     Replace `YOUR_PROJECT_ID` with your Google Cloud project ID.
 
-2.  **Build and tag the "green" application image:**
+2.  **Build and tag the "canary" application image:**
 
-    Navigate to the "green" application directory in Cloud Shell and run:
+    Navigate to the "canary" application directory in Cloud Shell and run:
 
     ```bash
-    docker build -t gcr.io/YOUR_PROJECT_ID/hello-green:v1 .
-    docker push gcr.io/YOUR_PROJECT_ID/hello-green:v1
+    docker build -t gcr.io/YOUR_PROJECT_ID/hello-canary:v1 .
+    docker push gcr.io/YOUR_PROJECT_ID/hello-canary:v1
     ```
 
     Again, replace `YOUR_PROJECT_ID` with your Google Cloud project ID.
 
-## Deploying the Blue Application to GKE with Terraform
+## Deploying the Stable Application to GKE with Terraform
 
-We will separate the Terraform configurations for better blue-green management.
+We will separate the Terraform configurations for better canary management.
 
 **1. `gke_cluster.tf` (Base Infrastructure - Create GKE Cluster)**
 
@@ -111,6 +122,10 @@ terraform {
       source  = "hashicorp/google"
       version = "~> 5.0"
     }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.20" # Ensure compatibility with your GKE version
+    }
   }
 }
 
@@ -119,17 +134,25 @@ provider "google" {
   region  = "YOUR_REGION"
 }
 
-resource "google_container_cluster" "blue_green_cluster" {
-  name               = "blue-green-cluster"
+provider "kubernetes" {
+  host                   = google_container_cluster.canary_cluster.endpoint
+  token                  = data.google_client_config.default.access_token
+  cluster_ca_certificate = base64decode(google_container_cluster.canary_cluster.master_auth[0].cluster_ca_certificate)
+}
+
+data "google_client_config" "default" {}
+
+resource "google_container_cluster" "canary_cluster" {
+  name               = "canary-cluster"
   location           = "YOUR_REGION"
   remove_default_node_pool = true
   initial_node_count       = 1
 }
 
-resource "google_container_node_pool" "blue_green_nodes" {
-  name           = "blue-green-pool"
+resource "google_container_node_pool" "canary_nodes" {
+  name           = "canary-pool"
   location       = "YOUR_REGION"
-  cluster        = google_container_cluster.blue_green_cluster.name
+  cluster        = google_container_cluster.canary_cluster.name
   node_count     = 2
   autoscaling {
     min_node_count = 1
@@ -146,42 +169,42 @@ resource "google_container_node_pool" "blue_green_nodes" {
 
 *   Save this code as `gke_cluster.tf`.
 *   Initialize Terraform: `terraform init`
-*   Plan the deployment: `terraform plan -var="environment=blue"`
+*   Plan the deployment: `terraform plan`
 *   Apply the configuration: `terraform apply --auto-approve`
 
-**2. `blue_app.tf` (Blue Application Deployment)**
+**2. `stable_app.tf` (Stable Application Deployment)**
 
-This file deploys the "hello-blue" application.
+This file deploys the "hello-stable" application.
 
 ```terraform
-resource "kubernetes_deployment" "blue_app_deployment" {
-  depends_on = [google_container_node_pool.blue_green_nodes]
+resource "kubernetes_deployment" "stable_app_deployment" {
+  depends_on = [google_container_node_pool.canary_nodes]
   metadata {
-    name = "hello-blue-deployment"
+    name = "hello-stable-deployment"
     labels = {
-      app     = "hello-app" # Consistent app label for service selector
-      version = "blue"
+      app     = "hello-app"
+      version = "stable"
     }
   }
   spec {
     replicas = 2
     selector {
       match_labels = {
-        app     = "hello-app" # Consistent app label for service selector
-        version = "blue"
+        app     = "hello-app"
+        version = "stable"
       }
     }
     template {
       metadata {
         labels = {
-          app     = "hello-app" # Consistent app label for service selector
-          version = "blue"
+          app     = "hello-app"
+          version = "stable"
         }
       }
       spec {
         containers {
-          name  = "hello-blue-container"
-          image = "gcr.io/YOUR_PROJECT_ID/hello-blue:v1"
+          name  = "hello-stable-container"
+          image = "gcr.io/YOUR_PROJECT_ID/hello-stable:v1"
           ports {
             container_port = 5000
           }
@@ -190,212 +213,257 @@ resource "kubernetes_deployment" "blue_app_deployment" {
     }
   }
 }
-```
 
-*   Save this code as `blue_app.tf`.
-*   Plan the deployment: `terraform plan`
-*   Apply the configuration: `terraform apply --auto-approve`
-
-**3. `load_balancer_service.tf` (Load Balancer Service)**
-
-This file defines the Load Balancer service that initially points to the "blue" application.
-
-```terraform
-resource "kubernetes_service" "hello_app_service" {
-  depends_on = [kubernetes_deployment.blue_app_deployment] # Initially depends on blue
+resource "kubernetes_service" "stable_app_service" {
   metadata {
-    name = "hello-app-service" # Consistent service name
+    name = "hello-stable-service" # Unique service name for stable
     labels = {
-      app = "hello-app" # Consistent app label
+      app = "hello-app"
+      version = "stable"
     }
   }
   spec {
     selector = {
-      app = "hello-app" # Selects pods with the 'app: hello-app' label
-      version = "blue" # Initially points to blue version
+      app = "hello-app"
+      version = "stable"
     }
     ports {
-      port        = 80
+      port        = 5000 # Internal service port
       target_port = 5000
     }
-    type = "LoadBalancer"
   }
 }
 ```
 
-*   Save this code as `load_balancer_service.tf`.
+*   Save this code as `stable_app.tf`.
 *   Plan the deployment: `terraform plan`
 *   Apply the configuration: `terraform apply --auto-approve`
 
-After applying these Terraform configurations, the "hello-blue" application should be accessible via the external IP of the `hello-app-service` Load Balancer. You can get the external IP using `kubectl get service hello-app-service -o wide` after the service is ready.
+**3. `canary_app.tf` (Canary Application Deployment)**
 
-## Gradually Upgrading to the Green App using Blue-Green Deployment (Terraform Switch)
+This file deploys the "hello-canary" application.
 
-1.  **Deploy the Green Application:**
-
-    Create a new Terraform configuration file `green_app.tf` for the "hello-green" app:
-
-    **4. `green_app.tf` (Green Application Deployment)**
-
-    ```terraform
-    resource "kubernetes_deployment" "green_app_deployment" {
-      depends_on = [google_container_node_pool.blue_green_nodes]
+```terraform
+resource "kubernetes_deployment" "canary_app_deployment" {
+  depends_on = [google_container_node_pool.canary_nodes]
+  metadata {
+    name = "hello-canary-deployment"
+    labels = {
+      app     = "hello-app"
+      version = "canary"
+    }
+  }
+  spec {
+    replicas = 1 # Start with fewer replicas for canary
+    selector {
+      match_labels = {
+        app     = "hello-app"
+        version = "canary"
+      }
+    }
+    template {
       metadata {
-        name = "hello-green-deployment"
         labels = {
-          app     = "hello-app" # Consistent app label for service selector
-          version = "green"
+          app     = "hello-app"
+          version = "canary"
         }
       }
       spec {
-        replicas = 2
-        selector {
-          match_labels = {
-            app     = "hello-app" # Consistent app label for service selector
-            version = "green"
-          }
-        }
-        template {
-          metadata {
-            labels = {
-              app     = "hello-app" # Consistent app label for service selector
-              version = "green"
-            }
-          }
-          spec {
-            containers {
-              name  = "hello-green-container"
-              image = "gcr.io/YOUR_PROJECT_ID/hello-green:v1"
-              ports {
-                container_port = 5000
-              }
-            }
+        containers {
+          name  = "hello-canary-container"
+          image = "gcr.io/YOUR_PROJECT_ID/hello-canary:v1"
+          ports {
+            container_port = 5000
           }
         }
       }
     }
-    ```
+  }
+}
 
-    *   Save this code as `green_app.tf`.
-    *   Plan the deployment: `terraform plan`
-    *   Apply the configuration: `terraform apply --auto-approve`
+resource "kubernetes_service" "canary_app_service" {
+  metadata {
+    name = "hello-canary-service" # Unique service name for canary
+    labels = {
+      app = "hello-app"
+      version = "canary"
+    }
+  }
+  spec {
+    selector = {
+      app = "hello-app"
+      version = "canary"
+    }
+    ports {
+      port        = 5000 # Internal service port
+      target_port = 5000
+    }
+  }
+}
+```
 
-    Now you have both "blue" and "green" applications deployed in your cluster. The Load Balancer is still pointing to "blue".
+*   Save this code as `canary_app.tf`.
+*   Plan the deployment: `terraform plan`
+*   Apply the configuration: `terraform apply --auto-approve`
 
-2.  **Switch Traffic to Green (Terraform Method):**
+**4. `gateway_api.tf` (Gateway API Configuration for Traffic Splitting)**
 
-    To switch traffic to the "green" application using Terraform, modify the `load_balancer_service.tf` file.  Change the `selector` section to target the "green" pods:
+This file configures the Gateway API resources to expose the application and split traffic between stable and canary.
 
-    ```terraform
-    resource "kubernetes_service" "hello_app_service" {
-      depends_on = [kubernetes_deployment.green_app_deployment] # Now depends on green (optional but good practice)
-      metadata {
-        name = "hello-app-service" # Consistent service name
-        labels = {
-          app = "hello-app" # Consistent app label
+```terraform
+# Assuming you have a GatewayClass already defined or a default one available.
+# If not, you may need to create a GatewayClass resource depending on your
+# Gateway API implementation (e.g., for a specific Ingress Controller).
+# This example assumes a 'gke-l7-gxlb' GatewayClass is available in GKE.
+
+resource "kubernetes_gateway" "hello_app_gateway" {
+  metadata {
+    name = "hello-app-gateway"
+  }
+  spec {
+    gateway_class_name = "gke-l7-gxlb" # Or your GatewayClass name
+    listeners {
+      name     = "http"
+      protocol = "HTTP"
+      port     = 80
+      allowed_routes {
+        namespaces {
+          from = "Same" # Or "All" depending on your needs
         }
-      }
-      spec {
-        selector = {
-          app = "hello-app" # Selects pods with the 'app: hello-app' label
-          version = "green" # Now points to green version
-        }
-        ports {
-          port        = 80
-          target_port = 5000
-        }
-        type = "LoadBalancer"
       }
     }
-    ```
+  }
+}
 
-    *   **Apply the updated Load Balancer configuration:** `terraform apply --auto-approve -target=kubernetes_service.hello_app_service`
 
-    Terraform will update the service to select the "green" pods. Traffic will now be routed to the "hello-green" application.
+resource "kubernetes_http_route" "hello_app_http_route" {
+  metadata {
+    name = "hello-app-http-route"
+  }
+  spec {
+    parent_refs {
+      name = kubernetes_gateway.hello_app_gateway.metadata[0].name
+      namespace = kubernetes_gateway.hello_app_gateway.metadata[0].namespace # Ensure namespace is correct
+    }
+    rules {
+      forward_to {
+        backend_refs {
+          name = kubernetes_service.stable_app_service.metadata[0].name
+          port = 5000
+          weight = 70 # 70% traffic to stable
+        }
+        backend_refs {
+          name = kubernetes_service.canary_app_service.metadata[0].name
+          port = 5000
+          weight = 30 # 30% traffic to canary
+        }
+      }
+    }
+  }
+}
+```
 
-    **Alternative Traffic Switch using `kubectl`:**
+*   Save this code as `gateway_api.tf`.
+*   Plan the deployment: `terraform plan`
+*   Apply the configuration: `terraform apply --auto-approve`
 
-    Alternatively, you can switch traffic using `kubectl` directly. This can be faster for immediate switches or rollbacks, but it bypasses Terraform state management.
+After applying these Terraform configurations, the application should be accessible via the external IP provisioned by the Gateway (Load Balancer).  You can check the Gateway's status using `kubectl get gateway hello-app-gateway -o wide` to find the external IP.  Accessing this IP should now route approximately 70% of traffic to "Hello, stable!" and 30% to "Hello, canary!".
 
-    *   **Get the current service definition:**
+## Gradually Adjusting Traffic Split (Terraform Method)
 
-        ```bash
-        kubectl get service hello-app-service -o yaml > hello-app-service.yaml
-        ```
+To adjust the traffic split, modify the `kubernetes_http_route.hello_app_http_route` resource in `gateway_api.tf`. For example, to increase canary traffic to 50% and decrease stable to 50%, change the `weight` values:
 
-        This saves the current service definition to a file `hello-app-service.yaml`.
+```terraform
+resource "kubernetes_http_route" "hello_app_http_route" {
+  # ... (metadata and parent_refs)
+  spec {
+    rules {
+      forward_to {
+        backend_refs {
+          name = kubernetes_service.stable_app_service.metadata[0].name
+          port = 5000
+          weight = 50 # 50% traffic to stable (now 50%)
+        }
+        backend_refs {
+          name = kubernetes_service.canary_app_service.metadata[0].name
+          port = 5000
+          weight = 50 # 50% traffic to canary (now 50%)
+        }
+      }
+    }
+  }
+}
+```
 
-    *   **Edit the service definition:**
+*   **Apply the updated HTTPRoute configuration:** `terraform apply --auto-approve -target=kubernetes_http_route.hello_app_http_route`
 
-        Open `hello-app-service.yaml` in a text editor.  Locate the `spec.selector.version` field and change its value from `blue` to `green`. Save the file.
+Terraform will update the HTTPRoute, and the Gateway will reconfigure the traffic splitting according to the new weights.
 
-        ```yaml
-        spec:
-          ports:
-          - port: 80
-            protocol: TCP
-            targetPort: 5000
-          selector:
-            app: hello-app
-            version: green  # Changed from blue to green
-          sessionAffinity: None
-          type: LoadBalancer
-        ```
+To fully roll out to canary (100% canary, 0% stable), you would set the weights like this:
 
-    *   **Apply the updated service definition:**
+```terraform
+resource "kubernetes_http_route" "hello_app_http_route" {
+  # ... (metadata and parent_refs)
+  spec {
+    rules {
+      forward_to {
+        backend_refs {
+          name = kubernetes_service.stable_app_service.metadata[0].name
+          port = 5000
+          weight = 0 # 0% traffic to stable
+        }
+        backend_refs {
+          name = kubernetes_service.canary_app_service.metadata[0].name
+          port = 5000
+          weight = 100 # 100% traffic to canary
+        }
+      }
+    }
+  }
+}
+```
 
-        ```bash
-        kubectl apply -f hello-app-service.yaml
-        ```
+And apply with Terraform again.
 
-    `kubectl` will update the service to select the "green" pods. Traffic will now be routed to the "hello-green" application.
+## Monitoring and Rollback
 
-3.  **Monitoring and Rollback:**
+Monitor your application after each traffic split adjustment. Observe metrics, logs, and error rates for both stable and canary versions.
 
-    Monitor your application after the switch by accessing the Load Balancer's external IP again. You should now see "Hello, green!". If issues arise, you can quickly rollback using either Terraform or `kubectl`:
+**Rollback:** To rollback traffic (e.g., if issues are found in the canary version), simply revert the `weight` values in `kubernetes_http_route.hello_app_http_route` back to the previous stable configuration (e.g., 70% stable, 30% canary, or 100% stable initially) and apply Terraform again.
 
-    *   **Rollback with Terraform:**
-        *   **Revert `load_balancer_service.tf`:** Change the `selector` in `load_balancer_service.tf` back to `version = "blue"`.
-        *   **Apply the reverted Load Balancer configuration:** `terraform apply --auto-approve -target=kubernetes_service.hello_app_service`
+## Choosing the Right Method for Traffic Splitting
 
-    *   **Rollback with `kubectl`:**
-        *   **Edit the service using `kubectl edit service hello-app-service`:**
-            ```bash
-            kubectl edit service hello-app-service
-            ```
-        *   **Change the `spec.selector.version` back to `blue`** in the editor. Save and exit.
-        *   Alternatively, if you saved the original `hello-app-service.yaml` (with `version: blue`), you can re-apply it:
-            ```bash
-            kubectl apply -f hello-app-service.yaml
-            ```
+* **Kubernetes Gateway API (Recommended Modern Approach):**
+    *   Kubernetes-native API for managing ingress, routing, and service exposure.
+    *   Supports traffic splitting, header-based routing, and more advanced routing features.
+    *   Declarative configuration and integrates well with Terraform.
+    *   Requires a Gateway API compatible Ingress Controller implementation.
 
-    Traffic will be immediately switched back to the "blue" application.
+* **Ingress Controllers with Canary Annotations (e.g., Nginx Ingress):**
+    *   Many Ingress Controllers (like Nginx Ingress) provide annotations or custom resources to enable canary deployments and traffic splitting.
+    *   Often simpler to set up initially than a full Service Mesh but might have limitations compared to Gateway API or Service Mesh.
+    *   Configuration is often done via annotations in Ingress resources, which can be managed with Terraform.
 
-4.  **Cleanup (Optional):**
-
-    Once the green deployment is stable and you are confident in the new version, you can scale down or remove the blue deployment resources (`blue_app.tf`) if desired to save resources.  However, keeping the blue deployment running (but not receiving traffic) provides a faster rollback path in the future.
-
-## Choosing the Right Method for Traffic Switching
-
-* **Terraform:**
-    * **Recommended for Infrastructure as Code:**  Managing infrastructure declaratively with Terraform ensures that your service configuration is version-controlled and reproducible.
-    * **Consistent State Management:** Terraform tracks the changes to your service, providing a clear history and allowing for easier rollback to previous states managed by Terraform.
-    * **Slower Switch Time:** Applying Terraform configurations takes time, so the switch might not be instantaneous.
-
-* **`kubectl`:**
-    * **Faster, Immediate Switching:**  Using `kubectl` to directly edit the service is generally faster for immediate traffic switching and rollbacks.
-    * **Manual and Imperative:**  This method is manual and imperative, meaning changes are not tracked in Terraform state unless you subsequently update your Terraform configuration to reflect the `kubectl` changes.
-    * **Useful for Emergency Rollbacks or Quick Adjustments:**  If you need to quickly rollback during an incident or make a rapid switch outside of your standard Terraform workflow, `kubectl` is a convenient tool.
+* **Service Mesh (e.g., Istio, Linkerd):**
+    *   Provides the most comprehensive set of traffic management features, including fine-grained traffic splitting, observability, security, and more.
+    *   More complex to set up and manage but offers the most powerful capabilities for microservices and complex deployments.
+    *   Traffic management is typically configured using Service Mesh specific resources (e.g., Istio VirtualServices), which can be managed with Terraform providers for the respective Service Mesh.
 
 **Best Practice:**
 
-While `kubectl` offers a quick alternative, **it is generally recommended to use Terraform for managing your blue-green switch** to maintain infrastructure as code principles and benefit from Terraform's state management and version control.  Use `kubectl` for emergency rollbacks or quick checks, but ensure you update your Terraform configuration to reflect any changes made via `kubectl` to keep your infrastructure state consistent.
+For new deployments and when you need fine-grained traffic splitting and modern Kubernetes practices, **Kubernetes Gateway API is highly recommended.**  It provides a standard, declarative, and extensible way to manage traffic routing, including canary deployments. Terraform is the ideal tool to manage these Gateway API resources declaratively and version-controlled.
 
-## Key Considerations for Blue-Green Deployments
+## Key Considerations for Canary Deployments with Traffic Splitting
 
-* **Database Migrations:** Plan for database schema changes to be compatible with both versions during the transition.
-* **Feature Flags:** Consider using feature flags for more complex rollouts and gradual feature releases.
-* **Testing:** Thoroughly test the green environment before switching production traffic. Consider deploying the green app initially with `type: ClusterIP` service for internal testing before exposing it via the Load Balancer switch.
-* **Health Checks:** Ensure proper health checks are configured for your deployments (you can add `liveness_probe` and `readiness_probe` blocks within the container spec in Terraform).
+*   **Gateway API Implementation:** Ensure you have a compatible Gateway API implementation (Ingress Controller) installed in your GKE cluster. Configure the `gateway_class_name` in `gateway_api.tf` accordingly.
+*   **Monitoring and Metrics:** Robust monitoring is crucial. Track metrics for both stable and canary versions to make informed decisions about rollout or rollback.
+*   **Automated Analysis (Recommended):** Consider automating the analysis of metrics to automatically adjust traffic weights or trigger rollbacks based on predefined criteria.
+*   **Canary Release Phases:** Plan your canary rollout in phases (e.g., 10%, 30%, 50%, 70%, 100% traffic to canary) with monitoring and evaluation at each stage.
+*   **Health Checks and Rollback Triggers:** Configure detailed health checks for your applications and set up automated rollback triggers based on health check failures or error rate thresholds.
+*   **Database Migrations and Feature Flags:**  Plan for database schema changes and use feature flags to decouple code deployments from feature releases, making canary deployments safer.
 
+This README demonstrates how to implement canary deployments with traffic splitting using Kubernetes Gateway API and Terraform. By adjusting the `weight` values in the `kubernetes_http_route` resource, you can control the percentage of traffic routed to the canary version, enabling gradual and controlled rollouts of new application versions. Remember to replace placeholders like `YOUR_PROJECT_ID`, `YOUR_REGION`, and `gke-l7-gxlb` with your actual values and GatewayClass name.
 
+--- END OF FILE README (Canary Traffic Split).md ---
+
+This revised README provides a more accurate and practical approach to canary deployments with traffic splitting using Kubernetes Gateway API and Terraform. It includes the necessary Terraform configurations, explains how to adjust traffic weights, and emphasizes the importance of Gateway API as a modern solution.  Make sure to adapt the `gateway_class_name` to your specific GKE setup and the Gateway API implementation you are using.
